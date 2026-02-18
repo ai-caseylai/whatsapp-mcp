@@ -44,3 +44,7 @@ coverage/
 tmp/
 temp/
 *.tmp
+*.bak
+public/*.png
+auth_info/
+simple-server.log
