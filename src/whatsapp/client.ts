@@ -15,6 +15,9 @@ import { Boom } from '@hapi/boom';
 import { SupabaseDatabase } from '../db/supabase.js';
 import type { WaUser, WhatsAppConnectionState } from '../types/index.js';
 import { MessageHandler } from './message-handler.js';
+import QRCodeLib from 'qrcode';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const logger = pino({ level: 'warn' });
 
@@ -72,7 +75,17 @@ export class WhatsAppClient {
       if (qr) {
         this.state.qr = qr;
         console.log(`\n[WhatsApp User: ${this.user.phone_number}] Scan this QR code:`);
+        console.log('[QR_AVAILABLE] QR code is ready at /qr-code.png');
         qrcode.generate(qr, { small: true });
+        
+        // 保存 QR 码为图片文件供网页使用
+        
+        const publicDir = path.join(process.cwd(), 'public');
+        if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+        QRCodeLib.toFile(path.join(publicDir, 'qr-code.png'), qr, { width: 400 })
+          .then(() => console.log('[QR_SAVED] Saved to public/qr-code.png'))
+          .catch((err: any) => console.error('[QR_SAVE_ERROR]', err));
+        
         this.state.connection = 'connecting';
       }
 
@@ -90,7 +103,8 @@ export class WhatsAppClient {
         if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
           console.log(`[WhatsApp] Reconnecting... Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
-          setTimeout(() => this.initialize(), 5000 * this.reconnectAttempts);
+          console.log("[WhatsApp] QR expired or connection failed, regenerating...");
+          setTimeout(() => this.initialize(), 2000);
         } else if (!shouldReconnect) {
           console.log(`[WhatsApp] Logged out for ${this.user.phone_number}`);
           // 清除认证信息

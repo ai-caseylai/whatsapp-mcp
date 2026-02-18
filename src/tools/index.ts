@@ -531,6 +531,22 @@ export class WhatsAppMCPServer {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.log('[MCP Server] WhatsApp MCP Server started');
+    this.autoInitWhatsApp().catch(console.error);
+  }
+
+
+
+  private async autoInitWhatsApp(): Promise<void> {
+    try {
+      const phone = process.env.WHATSAPP_PHONE_NUMBER;
+      if (!phone) { console.error('[MCP] No phone'); return; }
+      let user = await this.db.getUserByPhone(phone);
+      if (!user) { user = await this.db.createUser({ phone_number: phone, is_active: true }); }
+      this.user = user;
+      this.whatsappClient = new WhatsAppClient(user, this.db);
+      await this.whatsappClient.initialize();
+      console.log('[MCP Server] WhatsApp ready');
+    } catch (err) { console.error('[MCP] Init error:', err); }
   }
 
   async stop(): Promise<void> {

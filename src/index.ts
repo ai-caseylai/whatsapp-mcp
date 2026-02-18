@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 
+// 全局错误处理
+process.on('unhandledRejection', (err) => {
+  console.error('[UnhandledRejection]', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException]', err);
+});
+
 import { SupabaseDatabase } from './db/supabase.js';
 import { WhatsAppMCPServer } from './tools/index.js';
 
@@ -16,25 +24,12 @@ async function main() {
   console.log('[WhatsApp MCP] Starting server...');
   console.log('[WhatsApp MCP] Phone:', process.env.WHATSAPP_PHONE_NUMBER);
 
-  // 初始化数据库连接
-  const db = new SupabaseDatabase();
+  const db = new SupabaseDatabase(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_KEY!
+  );
 
-  // 创建并启动 MCP Server
   const server = new WhatsAppMCPServer(db);
-
-  // 优雅关闭
-  process.on('SIGINT', async () => {
-    console.log('\n[WhatsApp MCP] Shutting down...');
-    await server.stop();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', async () => {
-    console.log('\n[WhatsApp MCP] Shutting down...');
-    await server.stop();
-    process.exit(0);
-  });
-
   await server.start();
 }
 
