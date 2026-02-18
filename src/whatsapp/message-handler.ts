@@ -1,14 +1,20 @@
-import { WAMessage, proto } from '@whiskeysockets/baileys';
+import { WAMessage, proto, downloadMediaMessage } from '@whiskeysockets/baileys';
 import { SupabaseDatabase } from '../db/supabase.js';
 import type { WaUser, WaMessage } from '../types/index.js';
+import { createLogger } from '../utils/index.js';
+import type { WhatsAppClient } from './client.js';
+
+const log = createLogger('MessageHandler');
 
 export class MessageHandler {
   private user: WaUser;
   private db: SupabaseDatabase;
+  private whatsappClient: WhatsAppClient;
 
-  constructor(user: WaUser, db: SupabaseDatabase) {
+  constructor(user: WaUser, db: SupabaseDatabase, whatsappClient: WhatsAppClient) {
     this.user = user;
     this.db = db;
+    this.whatsappClient = whatsappClient;
   }
 
   // ==================== 入站消息处理 ====================
@@ -45,7 +51,7 @@ export class MessageHandler {
       }
 
     } catch (error) {
-      console.error('[MessageHandler] Error handling incoming message:', error);
+      log.error({ error }, 'Error handling incoming message');
     }
   }
 
@@ -70,7 +76,7 @@ export class MessageHandler {
         timestamp: new Date().toISOString()
       });
     } catch (error) {
-      console.error('[MessageHandler] Error handling outgoing message:', error);
+      log.error({ error }, 'Error handling outgoing message');
     }
   }
 
@@ -113,7 +119,7 @@ export class MessageHandler {
       }
 
     } catch (error) {
-      console.error('[MessageHandler] Error handling message update:', error);
+      log.error({ error }, 'Error handling message update');
     }
   }
 
@@ -226,6 +232,7 @@ export class MessageHandler {
     const message = msg.message;
     if (!message) return {};
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let mediaData: any;
 
     if (message.imageMessage) mediaData = message.imageMessage;
@@ -237,10 +244,10 @@ export class MessageHandler {
     if (!mediaData) return {};
 
     return {
-      media_mime_type: mediaData.mimetype,
-      media_file_name: mediaData.fileName,
+      media_mime_type: mediaData.mimetype ?? undefined,
+      media_file_name: mediaData.fileName ?? undefined,
       media_file_size: mediaData.fileLength ? Number(mediaData.fileLength) : undefined,
-      media_duration: mediaData.seconds || undefined
+      media_duration: mediaData.seconds ?? undefined
     };
   }
 
@@ -284,13 +291,69 @@ export class MessageHandler {
 
   // ==================== 媒体下载 ====================
 
-  private async handleMediaDownload(msg: WAMessage, messageId: string): Promise<void> {
-    // 这里可以实现媒体下载逻辑
-    // 1. 使用 baileys 的 downloadMediaMessage 下载媒体
-    // 2. 上传到 Supabase Storage
-    // 3. 更新数据库中的 media_url
+  async handleMediaDownload(msg: WAMessage, messageId: string): Promise<void> {
+    const socket = this.whatsappClient.getSocket();
+    if (!socket) {
+      log.warn({ messageId }, 'Cannot download media: socket not available');
+      return;
+    }
 
-    // 暂时跳过实现，因为需要 socket 实例
-    console.log(`[MessageHandler] Media message received: ${messageId}`);
+    try {
+      log.debug({ messageId }, 'Starting media download');
+      
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          logger: { error: () => {}, warn: () => {}, info: () => {}, debug: () => {}, trace: () => {} } as any,
+          reuploadRequest: socket.updateMediaMessage
+        }
+      );
+
+      if (!buffer) {
+        log.warn({ messageId }, 'Media download returned empty buffer');
+        return;
+      }
+
+      // 这里可以添加上传到 Supabase Storage 的逻辑
+      // 目前只记录下载成功
+      log.info({ 
+        messageId, 
+        size: (buffer as Buffer).length 
+      }, 'Media downloaded successfully');
+
+      // TODO: Upload to Supabase Storage
+      // const fileName = `media/${this.user.id}/${messageId}.${this.getExtension(msg)}`;
+      // await this.uploadToSupabase(fileName, buffer);
+
+    } catch (error) {
+      log.warn({ error, messageId }, 'Failed to download media');
+    }
+  }
+
+  // ==================== 辅助方法 ====================
+
+  private getExtension(msg: WAMessage): string {
+    const message = msg.message;
+    if (!message) return 'bin';
+
+    if (message.imageMessage) {
+      const mime = message.imageMessage.mimetype || '';
+      return mime.includes('png') ? 'png' : 'jpg';
+    }
+    if (message.videoMessage) {
+      return 'mp4';
+    }
+    if (message.audioMessage) {
+      return message.audioMessage.ptt ? 'ogg' : 'mp3';
+    }
+    if (message.documentMessage) {
+      const fileName = message.documentMessage.fileName || '';
+      const ext = fileName.split('.').pop();
+      return ext || 'bin';
+    }
+    return 'bin';
   }
 }

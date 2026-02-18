@@ -9,6 +9,28 @@ import {
 import { SupabaseDatabase } from '../db/supabase.js';
 import { WhatsAppClient } from '../whatsapp/client.js';
 import type { WaUser } from '../types/index.js';
+import {
+  SearchContactsSchema,
+  ListChatsSchema,
+  GetChatSchema,
+  ListMessagesSchema,
+  SearchMessagesSchema,
+  SendMessageSchema,
+  GetContactSchema,
+  SyncHistorySchema,
+  validateSchema,
+  type SearchContactsInput,
+  type ListChatsInput,
+  type GetChatInput,
+  type ListMessagesInput,
+  type SearchMessagesInput,
+  type SendMessageInput,
+  type GetContactInput,
+  type SyncHistoryInput
+} from '../schemas/index.js';
+import { createLogger, ConnectionError, ValidationError, CleanupManager } from '../utils/index.js';
+
+const log = createLogger('MCP-Server');
 
 // Tool 定义
 const TOOLS: Tool[] = [
@@ -185,6 +207,11 @@ export class WhatsAppMCPServer {
   private db: SupabaseDatabase;
   private whatsappClient: WhatsAppClient | null = null;
   private user: WaUser | null = null;
+  private cleanupManager = new CleanupManager();
+  private connectionState = {
+    isConnecting: false,
+    connectionPromise: null as Promise<void> | null
+  };
 
   constructor(db: SupabaseDatabase) {
     this.db = db;
@@ -218,47 +245,89 @@ export class WhatsAppMCPServer {
         // 确保 WhatsApp 客户端已初始化
         await this.ensureWhatsAppClient();
 
+        // Validate and route to appropriate handler
         switch (name) {
-          case 'whatsapp_search_contacts':
-            return await this.handleSearchContacts(args as any);
-          case 'whatsapp_list_chats':
-            return await this.handleListChats(args as any);
-          case 'whatsapp_get_chat':
-            return await this.handleGetChat(args as any);
-          case 'whatsapp_list_messages':
-            return await this.handleListMessages(args as any);
-          case 'whatsapp_search_messages':
-            return await this.handleSearchMessages(args as any);
-          case 'whatsapp_send_message':
-            return await this.handleSendMessage(args as any);
-          case 'whatsapp_get_contact':
-            return await this.handleGetContact(args as any);
+          case 'whatsapp_search_contacts': {
+            const validation = validateSchema(SearchContactsSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleSearchContacts(validation.data);
+          }
+          case 'whatsapp_list_chats': {
+            const validation = validateSchema(ListChatsSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleListChats(validation.data);
+          }
+          case 'whatsapp_get_chat': {
+            const validation = validateSchema(GetChatSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleGetChat(validation.data);
+          }
+          case 'whatsapp_list_messages': {
+            const validation = validateSchema(ListMessagesSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleListMessages(validation.data);
+          }
+          case 'whatsapp_search_messages': {
+            const validation = validateSchema(SearchMessagesSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleSearchMessages(validation.data);
+          }
+          case 'whatsapp_send_message': {
+            const validation = validateSchema(SendMessageSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleSendMessage(validation.data);
+          }
+          case 'whatsapp_get_contact': {
+            const validation = validateSchema(GetContactSchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleGetContact(validation.data);
+          }
           case 'whatsapp_get_connection_status':
             return await this.handleGetConnectionStatus();
-          case 'whatsapp_sync_history':
-            return await this.handleSyncHistory(args as any);
+          case 'whatsapp_sync_history': {
+            const validation = validateSchema(SyncHistorySchema, args);
+            if (!validation.success) return this.createErrorResponse(validation.error);
+            return await this.handleSyncHistory(validation.data);
+          }
           default:
             throw new Error(`Unknown tool: ${name}`);
         }
       } catch (error) {
-        console.error(`[MCP Server] Error calling tool ${name}:`, error);
-        return {
-          content: [{
-            type: 'text',
-            text: `Error: ${error instanceof Error ? error.message : String(error)}`
-          } as TextContent],
-          isError: true
-        };
+        log.error({ tool: name, error: error instanceof Error ? error.message : String(error) }, 'Tool execution failed');
+        return this.createErrorResponse(
+          error instanceof Error ? error.message : 'An unexpected error occurred'
+        );
       }
     });
   }
 
+  // ==================== Response Helpers ====================
+
+  private createErrorResponse(message: string) {
+    return {
+      content: [{
+        type: 'text',
+        text: `Error: ${message}`
+      } as TextContent],
+      isError: true
+    };
+  }
+
+  private createUserResponse(data: unknown) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(data, null, 2)
+      } as TextContent]
+    };
+  }
+
   // ==================== Tool Handlers ====================
 
-  private async handleSearchContacts(args: { query: string; limit?: number }) {
-    if (!this.user) throw new Error('User not initialized');
+  private async handleSearchContacts(args: SearchContactsInput) {
+    if (!this.user) throw new ConnectionError('User not initialized');
 
-    const contacts = await this.db.searchContacts(this.user.id, args.query, args.limit || 20);
+    const contacts = await this.db.searchContacts(this.user.id, args.query, args.limit);
 
     const formatted = contacts.map(c => ({
       jid: c.jid,
@@ -267,22 +336,17 @@ export class WhatsAppMCPServer {
       is_business: c.is_business
     }));
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(formatted, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse(formatted);
   }
 
-  private async handleListChats(args: { limit?: number; offset?: number; include_last_message?: boolean }) {
-    if (!this.user) throw new Error('User not initialized');
+  private async handleListChats(args: ListChatsInput) {
+    if (!this.user) throw new ConnectionError('User not initialized');
 
     const chats = await this.db.listChats(
       this.user.id,
-      args.limit || 50,
-      args.offset || 0,
-      args.include_last_message || false
+      args.limit,
+      args.offset,
+      args.include_last_message
     );
 
     const formatted = chats.map(c => ({
@@ -298,54 +362,36 @@ export class WhatsAppMCPServer {
       } : undefined
     }));
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(formatted, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse(formatted);
   }
 
-  private async handleGetChat(args: { chat_jid: string }) {
-    if (!this.user) throw new Error('User not initialized');
+  private async handleGetChat(args: GetChatInput) {
+    if (!this.user) throw new ConnectionError('User not initialized');
 
     const chat = await this.db.getChatByJid(this.user.id, args.chat_jid);
     if (!chat) {
-      return {
-        content: [{
-          type: 'text',
-          text: 'Chat not found'
-        } as TextContent]
-      };
+      return this.createUserResponse({ error: 'Chat not found' });
     }
 
-    // 获取最近消息统计
-    const recentMessages = await this.db.listMessages(this.user.id, args.chat_jid, 1);
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          jid: chat.jid,
-          name: chat.name,
-          type: chat.chat_type,
-          unread: chat.unread_count,
-          is_pinned: chat.is_pinned,
-          mute_until: chat.mute_until,
-          last_message_at: chat.last_message_at,
-          metadata: chat.metadata
-        }, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse({
+      jid: chat.jid,
+      name: chat.name,
+      type: chat.chat_type,
+      unread: chat.unread_count,
+      is_pinned: chat.is_pinned,
+      mute_until: chat.mute_until,
+      last_message_at: chat.last_message_at,
+      metadata: chat.metadata
+    });
   }
 
-  private async handleListMessages(args: { chat_jid: string; limit?: number; before_message_id?: string }) {
-    if (!this.user) throw new Error('User not initialized');
+  private async handleListMessages(args: ListMessagesInput) {
+    if (!this.user) throw new ConnectionError('User not initialized');
 
     const messages = await this.db.listMessages(
       this.user.id,
       args.chat_jid,
-      args.limit || 50,
+      args.limit,
       args.before_message_id
     );
 
@@ -362,22 +408,17 @@ export class WhatsAppMCPServer {
       } : undefined
     }));
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(formatted, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse(formatted);
   }
 
-  private async handleSearchMessages(args: { query: string; chat_jid?: string; limit?: number }) {
-    if (!this.user) throw new Error('User not initialized');
+  private async handleSearchMessages(args: SearchMessagesInput) {
+    if (!this.user) throw new ConnectionError('User not initialized');
 
     const messages = await this.db.searchMessages(
       this.user.id,
       args.query,
       args.chat_jid,
-      args.limit || 20
+      args.limit
     );
 
     const formatted = messages.map(m => ({
@@ -389,16 +430,11 @@ export class WhatsAppMCPServer {
       is_from_me: m.is_from_me
     }));
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(formatted, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse(formatted);
   }
 
-  private async handleSendMessage(args: { to: string; message: string; quoted_message_id?: string }) {
-    if (!this.whatsappClient) throw new Error('WhatsApp not connected');
+  private async handleSendMessage(args: SendMessageInput) {
+    if (!this.whatsappClient) throw new ConnectionError('WhatsApp not connected');
 
     const messageId = await this.whatsappClient.sendMessage(
       args.to,
@@ -406,82 +442,66 @@ export class WhatsAppMCPServer {
       args.quoted_message_id
     );
 
-    return {
-      content: [{
-        type: 'text',
-        text: `Message sent successfully. ID: ${messageId}`
-      } as TextContent]
-    };
+    log.info({ to: args.to, messageId }, 'Message sent successfully');
+
+    return this.createUserResponse({
+      success: true,
+      message: 'Message sent successfully',
+      message_id: messageId
+    });
   }
 
-  private async handleGetContact(args: { jid: string }) {
-    if (!this.user) throw new Error('User not initialized');
+  private async handleGetContact(args: GetContactInput) {
+    if (!this.user) throw new ConnectionError('User not initialized');
 
     const contact = await this.db.getContactByJid(this.user.id, args.jid);
     if (!contact) {
-      return {
-        content: [{
-          type: 'text',
-          text: 'Contact not found'
-        } as TextContent]
-      };
+      return this.createUserResponse({ error: 'Contact not found' });
     }
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          jid: contact.jid,
-          name: contact.name,
-          push_name: contact.push_name,
-          phone: contact.phone_number,
-          status: contact.status,
-          is_business: contact.is_business,
-          is_blocked: contact.is_blocked
-        }, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse({
+      jid: contact.jid,
+      name: contact.name,
+      push_name: contact.push_name,
+      phone: contact.phone_number,
+      status: contact.status,
+      is_business: contact.is_business,
+      is_blocked: contact.is_blocked
+    });
   }
 
   private async handleGetConnectionStatus() {
     const status = this.whatsappClient?.getState() || { connection: 'close' };
 
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          connection: status.connection,
-          connected: this.whatsappClient?.isConnected() || false,
-          qr_available: !!status.qr,
-          user: this.user ? {
-            phone: this.user.phone_number,
-            name: this.user.display_name
-          } : null
-        }, null, 2)
-      } as TextContent]
-    };
+    return this.createUserResponse({
+      connection: status.connection,
+      connected: this.whatsappClient?.isConnected() || false,
+      qr_available: !!status.qr,
+      user: this.user ? {
+        phone: this.user.phone_number,
+        name: this.user.display_name
+      } : null
+    });
   }
 
-  private async handleSyncHistory(args: { full_sync?: boolean; days_back?: number }) {
-    // 触发同步（通过重新初始化或发送同步命令）
-    // 实际同步由 Baileys 自动处理
-    return {
-      content: [{
-        type: 'text',
-        text: `Sync ${args.full_sync ? 'full' : 'incremental'} triggered. History sync is handled automatically by WhatsApp Web API.`
-      } as TextContent]
-    };
+  private async handleSyncHistory(args: SyncHistoryInput) {
+    log.info({ fullSync: args.full_sync, daysBack: args.days_back }, 'Sync history requested');
+    
+    return this.createUserResponse({
+      success: true,
+      message: `Sync ${args.full_sync ? 'full' : 'incremental'} triggered. History sync is handled automatically by WhatsApp Web API.`,
+      days_back: args.days_back
+    });
   }
 
   // ==================== Helpers ====================
 
   private async ensureWhatsAppClient(): Promise<void> {
-    // 从环境变量获取用户配置
     const phoneNumber = process.env.WHATSAPP_PHONE_NUMBER;
     const authUserId = process.env.WHATSAPP_AUTH_USER_ID;
 
     if (!phoneNumber) {
-      throw new Error('WHATSAPP_PHONE_NUMBER environment variable not set');
+      throw new ValidationError('WHATSAPP_PHONE_NUMBER environment variable not set');
     }
 
     // 如果已经有客户端且用户匹配，直接返回
@@ -489,39 +509,74 @@ export class WhatsAppMCPServer {
       return;
     }
 
-    // 查找或创建用户
-    let user = await this.db.getUserByPhone(phoneNumber);
-    
-    if (!user) {
-      user = await this.db.createUser({
-        phone_number: phoneNumber,
-        auth_user_id: authUserId,
-        is_active: true
-      });
-      console.log(`[MCP Server] Created new user: ${phoneNumber}`);
+    // 防止并发初始化
+    if (this.connectionState.isConnecting && this.connectionState.connectionPromise) {
+      await this.connectionState.connectionPromise;
+      return;
     }
 
-    this.user = user;
+    this.connectionState.isConnecting = true;
 
-    // 初始化 WhatsApp 客户端
-    this.whatsappClient = new WhatsAppClient(user, this.db);
-    await this.whatsappClient.initialize();
-
-    // 等待连接或 QR 码
-    await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('Connection timeout')), 30000);
+    try {
+      // 查找或创建用户
+      let user = await this.db.getUserByPhone(phoneNumber);
       
-      const checkConnection = setInterval(() => {
+      if (!user) {
+        user = await this.db.createUser({
+          phone_number: phoneNumber,
+          auth_user_id: authUserId,
+          is_active: true
+        });
+        log.info({ phoneNumber }, 'Created new user');
+      }
+
+      this.user = user;
+
+      // 初始化 WhatsApp 客户端
+      this.whatsappClient = new WhatsAppClient(user, this.db);
+      
+      // 创建连接 Promise
+      this.connectionState.connectionPromise = this.waitForConnection();
+      
+      await this.whatsappClient.initialize();
+      await this.connectionState.connectionPromise;
+      
+    } finally {
+      this.connectionState.isConnecting = false;
+      this.connectionState.connectionPromise = null;
+    }
+  }
+
+  private async waitForConnection(): Promise<void> {
+    const CONNECTION_TIMEOUT = 60000; // 60 seconds
+    const CHECK_INTERVAL = 1000; // 1 second
+
+    return new Promise((resolve, reject) => {
+      let timeoutId: NodeJS.Timeout;
+      let intervalId: NodeJS.Timeout;
+
+      const cleanup = () => {
+        this.cleanupManager.clearInterval(intervalId);
+        this.cleanupManager.clearTimeout(timeoutId);
+      };
+
+      timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new ConnectionError('Connection timeout - please scan QR code within 60 seconds'));
+      }, CONNECTION_TIMEOUT);
+      this.cleanupManager.addTimeout(timeoutId);
+
+      intervalId = setInterval(() => {
         const state = this.whatsappClient?.getState();
+        
         if (state?.connection === 'open') {
-          clearInterval(checkConnection);
-          clearTimeout(timeout);
-          resolve(undefined);
+          cleanup();
+          resolve();
         } else if (state?.qr) {
-          // 有 QR 码，让用户扫描
-          console.log('[MCP Server] Please scan the QR code above with WhatsApp');
+          log.info('Please scan the QR code above with WhatsApp');
         }
-      }, 1000);
+      }, CHECK_INTERVAL);
+      this.cleanupManager.addInterval(intervalId);
     });
   }
 
@@ -530,29 +585,39 @@ export class WhatsAppMCPServer {
   async start(): Promise<void> {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.log('[MCP Server] WhatsApp MCP Server started');
+    log.info('WhatsApp MCP Server started');
     this.autoInitWhatsApp().catch(console.error);
   }
-
-
 
   private async autoInitWhatsApp(): Promise<void> {
     try {
       const phone = process.env.WHATSAPP_PHONE_NUMBER;
-      if (!phone) { console.error('[MCP] No phone'); return; }
+      if (!phone) { 
+        log.warn('No WHATSAPP_PHONE_NUMBER configured'); 
+        return; 
+      }
+      
       let user = await this.db.getUserByPhone(phone);
-      if (!user) { user = await this.db.createUser({ phone_number: phone, is_active: true }); }
+      if (!user) { 
+        user = await this.db.createUser({ phone_number: phone, is_active: true }); 
+      }
       this.user = user;
       this.whatsappClient = new WhatsAppClient(user, this.db);
       await this.whatsappClient.initialize();
-      console.log('[MCP Server] WhatsApp ready');
-    } catch (err) { console.error('[MCP] Init error:', err); }
+      log.info('WhatsApp client initialized');
+    } catch (err) { 
+      log.error({ error: err }, 'Failed to initialize WhatsApp client'); 
+    }
   }
 
   async stop(): Promise<void> {
+    // Clean up all intervals and timeouts
+    await this.cleanupManager.cleanup();
+
     if (this.whatsappClient) {
       await this.whatsappClient.disconnect();
     }
     await this.server.close();
+    log.info('WhatsApp MCP Server stopped');
   }
 }

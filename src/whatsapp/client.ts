@@ -7,7 +7,8 @@ import makeWASocket, {
   proto,
   WAMessage,
   Contact,
-  Chat as BaileysChat
+  Chat as BaileysChat,
+  downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
@@ -18,8 +19,9 @@ import { MessageHandler } from './message-handler.js';
 import QRCodeLib from 'qrcode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { createLogger, WhatsAppError, ConnectionError, CleanupManager } from '../utils/index.js';
 
-const logger = pino({ level: 'warn' });
+const log = createLogger('WhatsApp');
 
 export class WhatsAppClient {
   private socket: WASocket | null = null;
@@ -30,34 +32,34 @@ export class WhatsAppClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private authStateFolder: string;
+  private cleanupManager = new CleanupManager();
 
   constructor(user: WaUser, db: SupabaseDatabase) {
     this.user = user;
     this.db = db;
-    this.messageHandler = new MessageHandler(user, db);
+    this.messageHandler = new MessageHandler(user, db, this);
     this.authStateFolder = `./auth_info/${user.id}`;
   }
 
   async initialize(): Promise<void> {
-    console.log(`[WhatsApp] Initializing client for user: ${this.user.phone_number}`);
+    log.info({ phoneNumber: this.user.phone_number }, 'Initializing WhatsApp client');
 
     const { state: authState, saveCreds } = await useMultiFileAuthState(this.authStateFolder);
     const { version } = await fetchLatestBaileysVersion();
 
     this.socket = makeWASocket({
       version,
-      logger,
-      printQRInTerminal: false, // 我们自定义 QR 码处理
+      logger: pino({ level: 'warn' }),
+      printQRInTerminal: false,
       auth: {
         creds: authState.creds,
-        keys: makeCacheableSignalKeyStore(authState.keys, logger)
+        keys: makeCacheableSignalKeyStore(authState.keys, pino({ level: 'warn' }))
       },
       browser: ['OpenClaw WhatsApp MCP', 'Chrome', '1.0.0'],
-      syncFullHistory: true, // 同步完整历史消息
+      syncFullHistory: true,
       markOnlineOnConnect: false,
       fireInitQueries: true,
       shouldIgnoreJid: (jid) => {
-        // 忽略状态更新
         return jid?.includes('status@broadcast') || false;
       }
     });
@@ -78,13 +80,13 @@ export class WhatsAppClient {
         console.log('[QR_AVAILABLE] QR code is ready at /qr-code.png');
         qrcode.generate(qr, { small: true });
         
-        // 保存 QR 码为图片文件供网页使用
-        
+        // 保存 QR 码为图片文件
         const publicDir = path.join(process.cwd(), 'public');
         if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
+        
         QRCodeLib.toFile(path.join(publicDir, 'qr-code.png'), qr, { width: 400 })
-          .then(() => console.log('[QR_SAVED] Saved to public/qr-code.png'))
-          .catch((err: any) => console.error('[QR_SAVE_ERROR]', err));
+          .then(() => log.info('QR code saved to public/qr-code.png'))
+          .catch((err: unknown) => log.error({ error: err }, 'Failed to save QR code'));
         
         this.state.connection = 'connecting';
       }
@@ -98,23 +100,35 @@ export class WhatsAppClient {
           date: new Date()
         };
 
-        console.log(`[WhatsApp] Connection closed for ${this.user.phone_number}. Should reconnect:`, shouldReconnect);
+        log.info({ 
+          phoneNumber: this.user.phone_number, 
+          shouldReconnect 
+        }, 'Connection closed');
 
         if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.reconnectAttempts++;
-          console.log(`[WhatsApp] Reconnecting... Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
-          console.log("[WhatsApp] QR expired or connection failed, regenerating...");
-          setTimeout(() => this.initialize(), 2000);
+          const delay = 2000 * this.reconnectAttempts;
+          
+          log.info({ 
+            attempt: this.reconnectAttempts, 
+            maxAttempts: this.maxReconnectAttempts,
+            delay 
+          }, 'Scheduling reconnection');
+
+          // FIX: Track timeout for cleanup
+          const timeoutId = setTimeout(() => {
+            this.initialize();
+          }, delay);
+          this.cleanupManager.addTimeout(timeoutId);
         } else if (!shouldReconnect) {
-          console.log(`[WhatsApp] Logged out for ${this.user.phone_number}`);
-          // 清除认证信息
+          log.info({ phoneNumber: this.user.phone_number }, 'Logged out, clearing credentials');
           await this.db.updateAuthCredentials(this.user.id, {});
         }
       } else if (connection === 'open') {
         this.state.connection = 'open';
         this.state.qr = undefined;
         this.reconnectAttempts = 0;
-        console.log(`[WhatsApp] Connected successfully for ${this.user.phone_number}`);
+        log.info({ phoneNumber: this.user.phone_number }, 'Connected successfully');
 
         // 更新用户状态
         await this.db.updateUser(this.user.id, {
@@ -130,7 +144,6 @@ export class WhatsAppClient {
     // 认证凭证更新
     this.socket.ev.on('creds.update', async (creds) => {
       await saveCreds();
-      // 同步到 Supabase (可选，用于备份)
       await this.db.updateAuthCredentials(this.user.id, {
         updated_at: new Date().toISOString()
       });
@@ -145,7 +158,7 @@ export class WhatsAppClient {
       }
     });
 
-    // 消息更新（状态变更、删除等）
+    // 消息更新
     this.socket.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         await this.messageHandler.handleMessageUpdate(update);
@@ -172,12 +185,13 @@ export class WhatsAppClient {
 
     // 历史消息同步进度
     this.socket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest }) => {
-      console.log(`[WhatsApp] History sync for ${this.user.phone_number}:`, {
+      log.info({ 
+        phoneNumber: this.user.phone_number,
         chats: chats.length,
         contacts: contacts.length,
         messages: messages.length,
         isLatest
-      });
+      }, 'History sync received');
 
       await this.handleHistorySync(chats, contacts, messages);
     });
@@ -191,19 +205,20 @@ export class WhatsAppClient {
     const logId = await this.db.createSyncLog(this.user.id, 'full');
 
     try {
-      console.log(`[WhatsApp] History sync initiated for ${this.user.phone_number}`);
+      log.info({ phoneNumber: this.user.phone_number }, 'History sync initiated');
 
       // 等待历史同步事件完成
-      setTimeout(async () => {
+      const timeoutId = setTimeout(async () => {
         await this.db.completeSyncLog(logId, {
           messages_synced: 0,
           chats_synced: 0,
           media_downloaded: 0
         });
       }, 30000);
+      this.cleanupManager.addTimeout(timeoutId);
 
     } catch (error) {
-      console.error('[WhatsApp] History sync failed:', error);
+      log.error({ error }, 'History sync failed');
       await this.db.failSyncLog(logId, String(error));
     }
   }
@@ -249,7 +264,8 @@ export class WhatsAppClient {
         messages.map(async (msg) => await this.messageHandler.convertWAMessage(msg))
       );
 
-      await this.db.batchCreateMessages(this.user.id, messageRecords.filter(Boolean) as any[]);
+      const validMessages = messageRecords.filter(Boolean) as Partial<import('../types/index.js').WaMessage>[];
+      await this.db.batchCreateMessages(this.user.id, validMessages);
 
       await this.db.completeSyncLog(logId, {
         messages_synced: messages.length,
@@ -257,14 +273,15 @@ export class WhatsAppClient {
         media_downloaded: 0
       });
 
-      console.log(`[WhatsApp] History sync completed for ${this.user.phone_number}:`, {
+      log.info({ 
+        phoneNumber: this.user.phone_number,
         chats: chats.length,
         contacts: contacts.length,
         messages: messages.length
-      });
+      }, 'History sync completed');
 
     } catch (error) {
-      console.error('[WhatsApp] History sync processing failed:', error);
+      log.error({ error }, 'History sync processing failed');
       await this.db.failSyncLog(logId, String(error));
     }
   }
@@ -348,33 +365,55 @@ export class WhatsAppClient {
   // ==================== 发送消息 ====================
 
   async sendMessage(to: string, message: string, quotedMessageId?: string): Promise<string> {
-    if (!this.socket) throw new Error('WhatsApp not connected');
-
-    // 确保 JID 格式正确
-    const jid = this.formatJid(to);
-
-    const options: any = { text: message };
-    
-    if (quotedMessageId) {
-      // 获取引用的消息
-      const quotedMsg = await this.db.getMessageById(this.user.id, quotedMessageId);
-      if (quotedMsg) {
-        const key = {
-          remoteJid: jid,
-          id: quotedMessageId,
-          fromMe: quotedMsg.is_from_me
-        };
-        // 需要重新获取完整消息对象来引用
-        // 这里简化处理
-      }
+    if (!this.socket) {
+      throw new ConnectionError('WhatsApp not connected');
     }
 
-    const result = await this.socket.sendMessage(jid, options);
-    
-    // 保存发送的消息到数据库
-    await this.messageHandler.handleOutgoingMessage(result!, jid, message);
+    const jid = this.formatJid(to);
 
-    return result?.key?.id || '';
+    try {
+      let result;
+      
+      if (quotedMessageId) {
+        const quotedMsg = await this.db.getMessageById(this.user.id, quotedMessageId);
+        if (quotedMsg) {
+          // 使用 extendedTextMessage 来引用消息
+          result = await this.socket.sendMessage(jid, {
+            text: message,
+            contextInfo: {
+              stanzaId: quotedMessageId,
+              participant: quotedMsg.sender_jid,
+              quotedMessage: {
+                conversation: quotedMsg.content || ''
+              }
+            }
+          });
+          log.debug({ quotedMessageId, jid }, 'Sending quoted message');
+        } else {
+          log.warn({ quotedMessageId }, 'Quoted message not found, sending without quote');
+          result = await this.socket.sendMessage(jid, { text: message });
+        }
+      } else {
+        result = await this.socket.sendMessage(jid, { text: message });
+      }
+      
+      // 保存发送的消息到数据库
+      if (result) {
+        await this.messageHandler.handleOutgoingMessage(result, jid, message);
+      }
+
+      const messageId = result?.key?.id || '';
+      log.info({ messageId, jid }, 'Message sent successfully');
+      
+      return messageId;
+    } catch (error) {
+      log.error({ error, jid }, 'Failed to send message');
+      throw new WhatsAppError(
+        `Failed to send message: ${error instanceof Error ? error.message : String(error)}`,
+        'SEND_FAILED',
+        true
+      );
+    }
   }
 
   async sendMedia(
@@ -383,56 +422,93 @@ export class WhatsAppClient {
     filePath: string,
     caption?: string
   ): Promise<string> {
-    if (!this.socket) throw new Error('WhatsApp not connected');
+    if (!this.socket) {
+      throw new ConnectionError('WhatsApp not connected');
+    }
 
     const jid = this.formatJid(to);
 
-    let result;
-    switch (mediaType) {
-      case 'image':
-        result = await this.socket.sendMessage(jid, {
-          image: { url: filePath },
-          caption
-        });
-        break;
-      case 'video':
-        result = await this.socket.sendMessage(jid, {
-          video: { url: filePath },
-          caption
-        });
-        break;
-      case 'audio':
-        result = await this.socket.sendMessage(jid, {
-          audio: { url: filePath },
-          mimetype: 'audio/mp4',
-          ptt: true // 语音消息
-        });
-        break;
-      case 'document':
-        result = await this.socket.sendMessage(jid, {
-          document: { url: filePath },
-          mimetype: 'application/pdf',
-          fileName: filePath.split('/').pop() || 'document.pdf',
-          caption
-        });
-        break;
+    try {
+      let result;
+      switch (mediaType) {
+        case 'image':
+          result = await this.socket.sendMessage(jid, {
+            image: { url: filePath },
+            caption
+          });
+          break;
+        case 'video':
+          result = await this.socket.sendMessage(jid, {
+            video: { url: filePath },
+            caption
+          });
+          break;
+        case 'audio':
+          result = await this.socket.sendMessage(jid, {
+            audio: { url: filePath },
+            mimetype: 'audio/mp4',
+            ptt: true
+          });
+          break;
+        case 'document':
+          result = await this.socket.sendMessage(jid, {
+            document: { url: filePath },
+            mimetype: 'application/pdf',
+            fileName: filePath.split('/').pop() || 'document.pdf',
+            caption
+          });
+          break;
+      }
+
+      const messageId = result?.key?.id || '';
+      log.info({ messageId, jid, mediaType }, 'Media sent successfully');
+      
+      return messageId;
+    } catch (error) {
+      log.error({ error, jid, mediaType }, 'Failed to send media');
+      throw new WhatsAppError(
+        `Failed to send media: ${error instanceof Error ? error.message : String(error)}`,
+        'MEDIA_SEND_FAILED',
+        true
+      );
+    }
+  }
+
+  // ==================== 媒体下载 ====================
+
+  async downloadMedia(msg: WAMessage): Promise<Buffer | null> {
+    if (!this.socket) {
+      throw new ConnectionError('WhatsApp not connected');
     }
 
-    return result?.key?.id || '';
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          logger: pino({ level: 'warn' }),
+          reuploadRequest: this.socket.updateMediaMessage
+        }
+      );
+      
+      log.debug({ messageId: msg.key.id }, 'Media downloaded successfully');
+      return buffer as Buffer;
+    } catch (error) {
+      log.warn({ error, messageId: msg.key.id }, 'Failed to download media');
+      return null;
+    }
   }
 
   // ==================== 工具方法 ====================
 
   private formatJid(input: string): string {
-    // 如果是纯数字，添加 WhatsApp JID 后缀
     if (/^\d+$/.test(input)) {
       return `${input}@s.whatsapp.net`;
     }
-    // 如果已经是 JID 格式，直接返回
     if (input.includes('@')) {
       return input;
     }
-    // 移除空格和特殊字符后尝试格式化
     const cleaned = input.replace(/\D/g, '');
     if (cleaned.length > 0) {
       return `${cleaned}@s.whatsapp.net`;
@@ -459,8 +535,16 @@ export class WhatsAppClient {
   }
 
   async disconnect(): Promise<void> {
+    // Clean up all tracked timeouts
+    await this.cleanupManager.cleanup();
+
     if (this.socket) {
-      await this.socket.logout();
+      try {
+        await this.socket.logout();
+        log.info({ phoneNumber: this.user.phone_number }, 'Disconnected successfully');
+      } catch (error) {
+        log.warn({ error }, 'Error during disconnect');
+      }
       this.socket = null;
     }
   }

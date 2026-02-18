@@ -3,6 +3,9 @@ import type {
   WaUser, WaChat, WaMessage, WaContact,
   ChatWithLastMessage, MessageWithMedia 
 } from '../types/index.js';
+import { createLogger, DatabaseError } from '../utils/index.js';
+
+const log = createLogger('Database');
 
 export class SupabaseDatabase {
   private client: SupabaseClient;
@@ -12,7 +15,7 @@ export class SupabaseDatabase {
     const supabaseKey = key || process.env.SUPABASE_SERVICE_KEY;
 
     if (!supabaseUrl || !supabaseKey) {
-      throw new Error('SUPABASE_URL and SUPABASE_SERVICE_KEY must be set');
+      throw new DatabaseError('SUPABASE_URL and SUPABASE_SERVICE_KEY must be set');
     }
 
     this.client = createClient(supabaseUrl, supabaseKey, {
@@ -21,71 +24,112 @@ export class SupabaseDatabase {
         persistSession: false
       }
     });
+    
+    log.info('Database client initialized');
+  }
+
+  // ==================== Helper Methods ====================
+
+  private logOperation(operation: string, details?: Record<string, unknown>) {
+    log.debug({ operation, ...details }, 'Database operation');
   }
 
   // ==================== User Operations ====================
 
   async getUserByPhone(phoneNumber: string): Promise<WaUser | null> {
+    this.logOperation('getUserByPhone', { phoneNumber });
+
     const { data, error } = await this.client
       .from('wa_users')
       .select('*')
       .eq('phone_number', phoneNumber)
-      .single();
+      .maybeSingle();
 
-    if (error) return null;
-    return data as WaUser;
+    if (error) {
+      log.warn({ phoneNumber, error: error.message }, 'Error fetching user by phone');
+      return null;
+    }
+    
+    return data as WaUser | null;
   }
 
   async getUserByAuthId(authUserId: string): Promise<WaUser | null> {
+    this.logOperation('getUserByAuthId', { authUserId });
+
     const { data, error } = await this.client
       .from('wa_users')
       .select('*')
       .eq('auth_user_id', authUserId)
-      .single();
+      .maybeSingle();
 
-    if (error) return null;
-    return data as WaUser;
+    if (error) {
+      log.warn({ authUserId, error: error.message }, 'Error fetching user by auth ID');
+      return null;
+    }
+    
+    return data as WaUser | null;
   }
 
   async createUser(userData: Partial<WaUser>): Promise<WaUser> {
+    this.logOperation('createUser', { phoneNumber: userData.phone_number });
+
     const { data, error } = await this.client
       .from('wa_users')
       .insert(userData)
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      log.error({ error: error.message }, 'Failed to create user');
+      throw new DatabaseError('Failed to create user', error);
+    }
+    
+    log.info({ userId: (data as WaUser).id }, 'User created successfully');
     return data as WaUser;
   }
 
   async updateUser(userId: string, updates: Partial<WaUser>): Promise<void> {
+    this.logOperation('updateUser', { userId });
+
     const { error } = await this.client
       .from('wa_users')
       .update(updates)
       .eq('id', userId);
 
-    if (error) throw error;
+    if (error) {
+      log.error({ userId, error: error.message }, 'Failed to update user');
+      throw new DatabaseError('Failed to update user', error);
+    }
   }
 
   async updateAuthCredentials(userId: string, credentials: Record<string, unknown>): Promise<void> {
+    this.logOperation('updateAuthCredentials', { userId });
     await this.updateUser(userId, { auth_credentials: credentials });
   }
 
   // ==================== Chat Operations ====================
 
   async getChatByJid(userId: string, jid: string): Promise<WaChat | null> {
+    this.logOperation('getChatByJid', { userId, jid });
+
     const { data, error } = await this.client
       .from('wa_chats')
       .select('*')
       .eq('user_id', userId)
       .eq('jid', jid)
-      .single();
+      .maybeSingle();
 
-    if (error) return null;
-    return data as WaChat;
+    if (error) {
+      log.warn({ userId, jid, error: error.message }, 'Error fetching chat');
+      return null;
+    }
+    
+    return data as WaChat | null;
   }
 
   async createOrUpdateChat(userId: string, chatData: Partial<WaChat>): Promise<WaChat> {
+    this.logOperation('createOrUpdateChat', { userId, jid: chatData.jid });
+
     const existing = await this.getChatByJid(userId, chatData.jid!);
     
     if (existing) {
@@ -96,7 +140,9 @@ export class SupabaseDatabase {
         .select()
         .single();
 
-      if (error) throw error;
+      if (error) {
+        throw new DatabaseError('Failed to update chat', error);
+      }
       return data as WaChat;
     } else {
       const { data, error } = await this.client
@@ -105,7 +151,9 @@ export class SupabaseDatabase {
         .select()
         .single();
 
-      if (error) throw error;
+      if (error) {
+        throw new DatabaseError('Failed to create chat', error);
+      }
       return data as WaChat;
     }
   }
@@ -116,7 +164,9 @@ export class SupabaseDatabase {
     offset = 0,
     includeLastMessage = false
   ): Promise<ChatWithLastMessage[]> {
-    let query = this.client
+    this.logOperation('listChats', { userId, limit, offset, includeLastMessage });
+
+    const { data, error } = await this.client
       .from('wa_chats')
       .select('*')
       .eq('user_id', userId)
@@ -124,33 +174,49 @@ export class SupabaseDatabase {
       .order('last_message_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
-    const { data, error } = await query;
-
-    if (error) throw error;
+    if (error) {
+      throw new DatabaseError('Failed to list chats', error);
+    }
 
     const chats = data as WaChat[];
 
-    if (includeLastMessage && chats.length > 0) {
-      const chatIds = chats.map(c => c.id);
-      const { data: messages } = await this.client
-        .from('wa_messages')
-        .select('*')
-        .in('chat_id', chatIds)
-        .eq('id', chats.map(c => c.last_message_id).filter(Boolean));
-
-      const messageMap = new Map((messages as WaMessage[] || []).map(m => [m.id, m]));
-      
-      return chats.map(chat => ({
-        ...chat,
-        last_message: chat.last_message_id ? messageMap.get(chat.last_message_id) : undefined
-      }));
+    if (!includeLastMessage || chats.length === 0) {
+      return chats;
     }
 
-    return chats;
+    // FIX: Correctly fetch last messages using .in() for multiple IDs
+    const lastMessageIds = chats
+      .map(c => c.last_message_id)
+      .filter((id): id is string => id !== null && id !== undefined);
+
+    if (lastMessageIds.length === 0) {
+      return chats;
+    }
+
+    const { data: messages, error: messagesError } = await this.client
+      .from('wa_messages')
+      .select('*')
+      .in('id', lastMessageIds);
+
+    if (messagesError) {
+      log.warn({ error: messagesError.message }, 'Error fetching last messages');
+      return chats;
+    }
+
+    const messageMap = new Map(
+      (messages as WaMessage[] || []).map(m => [m.id, m])
+    );
+    
+    return chats.map(chat => ({
+      ...chat,
+      last_message: chat.last_message_id ? messageMap.get(chat.last_message_id) : undefined
+    }));
   }
 
   async updateChatLastMessage(chatId: string, messageId: string, timestamp: string): Promise<void> {
-    await this.client
+    this.logOperation('updateChatLastMessage', { chatId, messageId });
+
+    const { error } = await this.client
       .from('wa_chats')
       .update({
         last_message_id: messageId,
@@ -158,23 +224,52 @@ export class SupabaseDatabase {
         updated_at: new Date().toISOString()
       })
       .eq('id', chatId);
+
+    if (error) {
+      log.warn({ chatId, error: error.message }, 'Failed to update chat last message');
+    }
   }
 
   // ==================== Message Operations ====================
 
   async getMessageById(userId: string, messageId: string): Promise<WaMessage | null> {
+    this.logOperation('getMessageById', { userId, messageId });
+
     const { data, error } = await this.client
       .from('wa_messages')
       .select('*')
       .eq('user_id', userId)
       .eq('message_id', messageId)
-      .single();
+      .maybeSingle();
 
-    if (error) return null;
-    return data as WaMessage;
+    if (error) {
+      log.warn({ messageId, error: error.message }, 'Error fetching message');
+      return null;
+    }
+    
+    return data as WaMessage | null;
+  }
+
+  async getMessageByDbId(dbId: string): Promise<WaMessage | null> {
+    this.logOperation('getMessageByDbId', { dbId });
+
+    const { data, error } = await this.client
+      .from('wa_messages')
+      .select('*')
+      .eq('id', dbId)
+      .maybeSingle();
+
+    if (error) {
+      log.warn({ dbId, error: error.message }, 'Error fetching message by DB ID');
+      return null;
+    }
+    
+    return data as WaMessage | null;
   }
 
   async createMessage(userId: string, messageData: Partial<WaMessage>): Promise<WaMessage> {
+    this.logOperation('createMessage', { userId, messageId: messageData.message_id });
+
     const { data, error } = await this.client
       .from('wa_messages')
       .insert({ ...messageData, user_id: userId })
@@ -184,6 +279,8 @@ export class SupabaseDatabase {
     if (error) {
       // 如果消息已存在，尝试更新
       if (error.code === '23505') { // unique violation
+        log.debug({ messageId: messageData.message_id }, 'Message exists, updating');
+        
         const existing = await this.getMessageById(userId, messageData.message_id!);
         if (existing) {
           const { data: updated } = await this.client
@@ -195,7 +292,7 @@ export class SupabaseDatabase {
           return updated as WaMessage;
         }
       }
-      throw error;
+      throw new DatabaseError('Failed to create message', error);
     }
 
     // 更新聊天的最后消息
@@ -216,8 +313,13 @@ export class SupabaseDatabase {
     limit = 50,
     beforeMessageId?: string
   ): Promise<MessageWithMedia[]> {
+    this.logOperation('listMessages', { userId, chatJid, limit, beforeMessageId });
+
     const chat = await this.getChatByJid(userId, chatJid);
-    if (!chat) return [];
+    if (!chat) {
+      log.warn({ chatJid }, 'Chat not found for listing messages');
+      return [];
+    }
 
     let query = this.client
       .from('wa_messages')
@@ -239,8 +341,11 @@ export class SupabaseDatabase {
 
     const { data, error } = await query;
 
-    if (error) throw error;
-    return (data as unknown as MessageWithMedia[]).reverse(); // 按时间正序返回
+    if (error) {
+      throw new DatabaseError('Failed to list messages', error);
+    }
+    
+    return (data as unknown as MessageWithMedia[] || []).reverse();
   }
 
   async searchMessages(
@@ -249,6 +354,8 @@ export class SupabaseDatabase {
     chatJid?: string,
     limit = 20
   ): Promise<WaMessage[]> {
+    this.logOperation('searchMessages', { userId, query, chatJid, limit });
+
     let dbQuery = this.client
       .from('wa_messages')
       .select('*')
@@ -265,8 +372,10 @@ export class SupabaseDatabase {
     }
 
     const { data, error } = await dbQuery;
-    if (error) throw error;
-    return data as WaMessage[];
+    if (error) {
+      throw new DatabaseError('Failed to search messages', error);
+    }
+    return (data as WaMessage[]) || [];
   }
 
   async updateMessageStatus(
@@ -274,28 +383,42 @@ export class SupabaseDatabase {
     messageId: string,
     status: WaMessage['status']
   ): Promise<void> {
-    await this.client
+    this.logOperation('updateMessageStatus', { userId, messageId, status });
+
+    const { error } = await this.client
       .from('wa_messages')
       .update({ status, updated_at: new Date().toISOString() })
       .eq('user_id', userId)
       .eq('message_id', messageId);
+
+    if (error) {
+      log.warn({ messageId, error: error.message }, 'Failed to update message status');
+    }
   }
 
   // ==================== Contact Operations ====================
 
   async getContactByJid(userId: string, jid: string): Promise<WaContact | null> {
+    this.logOperation('getContactByJid', { userId, jid });
+
     const { data, error } = await this.client
       .from('wa_contacts')
       .select('*')
       .eq('user_id', userId)
       .eq('jid', jid)
-      .single();
+      .maybeSingle();
 
-    if (error) return null;
-    return data as WaContact;
+    if (error) {
+      log.warn({ jid, error: error.message }, 'Error fetching contact');
+      return null;
+    }
+    
+    return data as WaContact | null;
   }
 
   async createOrUpdateContact(userId: string, contactData: Partial<WaContact>): Promise<WaContact> {
+    this.logOperation('createOrUpdateContact', { userId, jid: contactData.jid });
+
     const existing = await this.getContactByJid(userId, contactData.jid!);
     
     if (existing) {
@@ -306,7 +429,9 @@ export class SupabaseDatabase {
         .select()
         .single();
 
-      if (error) throw error;
+      if (error) {
+        throw new DatabaseError('Failed to update contact', error);
+      }
       return data as WaContact;
     } else {
       const { data, error } = await this.client
@@ -315,12 +440,16 @@ export class SupabaseDatabase {
         .select()
         .single();
 
-      if (error) throw error;
+      if (error) {
+        throw new DatabaseError('Failed to create contact', error);
+      }
       return data as WaContact;
     }
   }
 
   async searchContacts(userId: string, query: string, limit = 20): Promise<WaContact[]> {
+    this.logOperation('searchContacts', { userId, query, limit });
+
     const { data, error } = await this.client
       .from('wa_contacts')
       .select('*')
@@ -328,8 +457,10 @@ export class SupabaseDatabase {
       .or(`name.ilike.%${query}%,push_name.ilike.%${query}%,jid.ilike.%${query}%`)
       .limit(limit);
 
-    if (error) throw error;
-    return data as WaContact[];
+    if (error) {
+      throw new DatabaseError('Failed to search contacts', error);
+    }
+    return (data as WaContact[]) || [];
   }
 
   // ==================== Sync Operations ====================
@@ -338,6 +469,8 @@ export class SupabaseDatabase {
     userId: string,
     syncType: string
   ): Promise<string> {
+    this.logOperation('createSyncLog', { userId, syncType });
+
     const { data, error } = await this.client
       .from('wa_sync_logs')
       .insert({
@@ -349,7 +482,9 @@ export class SupabaseDatabase {
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      throw new DatabaseError('Failed to create sync log', error);
+    }
     return (data as { id: string }).id;
   }
 
@@ -361,31 +496,47 @@ export class SupabaseDatabase {
       media_downloaded: number;
     }
   ): Promise<void> {
-    await this.client
+    this.logOperation('completeSyncLog', { logId, stats });
+
+    const { error } = await this.client
       .from('wa_sync_logs')
       .update({
         status: 'completed',
-        ...stats,
+        messages_synced: stats.messages_synced,
+        chats_synced: stats.chats_synced,
+        media_downloaded: stats.media_downloaded,
         completed_at: new Date().toISOString()
       })
       .eq('id', logId);
+
+    if (error) {
+      log.warn({ logId, error: error.message }, 'Failed to complete sync log');
+    }
   }
 
-  async failSyncLog(logId: string, error: string): Promise<void> {
-    await this.client
+  async failSyncLog(logId: string, errorMsg: string): Promise<void> {
+    this.logOperation('failSyncLog', { logId });
+
+    const { error } = await this.client
       .from('wa_sync_logs')
       .update({
         status: 'failed',
-        errors: [error],
+        errors: [errorMsg],
         completed_at: new Date().toISOString()
       })
       .eq('id', logId);
+
+    if (error) {
+      log.warn({ logId, error: error.message }, 'Failed to update failed sync log');
+    }
   }
 
   // ==================== Batch Operations ====================
 
-  async batchCreateMessages(userId: string, messages: Partial<WaMessage>[]): Promise<void> {
-    if (messages.length === 0) return;
+  async batchCreateMessages(userId: string, messages: Partial<WaMessage>[]): Promise<number> {
+    if (messages.length === 0) return 0;
+
+    this.logOperation('batchCreateMessages', { userId, count: messages.length });
 
     const messagesWithUserId = messages.map(m => ({ ...m, user_id: userId }));
 
@@ -396,11 +547,17 @@ export class SupabaseDatabase {
         ignoreDuplicates: true 
       });
 
-    if (error) throw error;
+    if (error) {
+      log.warn({ error: error.message }, 'Batch message insert had errors');
+    }
+
+    return messages.length;
   }
 
-  async batchCreateChats(userId: string, chats: Partial<WaChat>[]): Promise<void> {
-    if (chats.length === 0) return;
+  async batchCreateChats(userId: string, chats: Partial<WaChat>[]): Promise<number> {
+    if (chats.length === 0) return 0;
+
+    this.logOperation('batchCreateChats', { userId, count: chats.length });
 
     const chatsWithUserId = chats.map(c => ({ ...c, user_id: userId }));
 
@@ -411,11 +568,17 @@ export class SupabaseDatabase {
         ignoreDuplicates: false 
       });
 
-    if (error) throw error;
+    if (error) {
+      log.warn({ error: error.message }, 'Batch chat insert had errors');
+    }
+
+    return chats.length;
   }
 
-  async batchCreateContacts(userId: string, contacts: Partial<WaContact>[]): Promise<void> {
-    if (contacts.length === 0) return;
+  async batchCreateContacts(userId: string, contacts: Partial<WaContact>[]): Promise<number> {
+    if (contacts.length === 0) return 0;
+
+    this.logOperation('batchCreateContacts', { userId, count: contacts.length });
 
     const contactsWithUserId = contacts.map(c => ({ ...c, user_id: userId }));
 
@@ -426,6 +589,10 @@ export class SupabaseDatabase {
         ignoreDuplicates: false 
       });
 
-    if (error) throw error;
+    if (error) {
+      log.warn({ error: error.message }, 'Batch contact insert had errors');
+    }
+
+    return contacts.length;
   }
 }
