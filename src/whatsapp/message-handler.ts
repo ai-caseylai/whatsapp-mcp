@@ -40,7 +40,7 @@ export class MessageHandler {
       }
 
       // 处理媒体下载
-      if (messageData.message_type !== 'text' && this.user.sync_settings?.download_media) {
+      if (messageData.message_type !== 'text' && this.user.sync_settings?.download_media && messageData.message_id) {
         await this.handleMediaDownload(msg, messageData.message_id);
       }
 
@@ -129,7 +129,7 @@ export class MessageHandler {
     return {
       message_id: msg.key.id!,
       sender_jid: msg.key.participant || msg.key.remoteJid!,
-      sender_name: msg.pushName,
+      sender_name: msg.pushName ?? undefined,
       message_type: messageType,
       content: content || undefined,
       ...mediaInfo,

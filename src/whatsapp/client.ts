@@ -1,13 +1,11 @@
 import makeWASocket, {
   DisconnectReason,
   WASocket,
-  BAILEYS_INITIALIZER,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   proto,
   WAMessage,
-  WAConnectionState,
   Contact,
   Chat as BaileysChat
 } from '@whiskeysockets/baileys';
@@ -179,15 +177,12 @@ export class WhatsAppClient {
     const logId = await this.db.createSyncLog(this.user.id, 'full');
 
     try {
-      // 获取云端聊天记录摘要
-      const syncSummary = await this.socket.fetchMessageHistory(50);
-      
       console.log(`[WhatsApp] History sync initiated for ${this.user.phone_number}`);
 
-      // 等待一段时间让同步完成
+      // 等待历史同步事件完成
       setTimeout(async () => {
         await this.db.completeSyncLog(logId, {
-          messages_synced: 0, // 实际数量在历史同步事件中统计
+          messages_synced: 0,
           chats_synced: 0,
           media_downloaded: 0
         });
@@ -210,15 +205,13 @@ export class WhatsAppClient {
       // 批量保存聊天
       const chatRecords = chats.map(chat => ({
         jid: chat.id,
-        name: chat.name,
+        name: chat.name ?? undefined,
         chat_type: chat.id.includes('@g.us') ? 'group' as const : 'individual' as const,
         unread_count: chat.unreadCount || 0,
         is_pinned: !!chat.pinned,
-        mute_until: chat.mute ? new Date(chat.mute * 1000).toISOString() : undefined,
         metadata: {
           archived: chat.archived,
-          pinned: chat.pinned,
-          mute: chat.mute
+          pinned: chat.pinned
         }
       }));
 
@@ -299,18 +292,16 @@ export class WhatsAppClient {
     for (const chat of chats) {
       await this.db.createOrUpdateChat(this.user.id, {
         jid: chat.id,
-        name: chat.name,
+        name: chat.name ?? undefined,
         chat_type: chat.id.includes('@g.us') ? 'group' : 'individual',
         unread_count: chat.unreadCount || 0,
         is_pinned: !!chat.pinned,
-        mute_until: chat.mute ? new Date(chat.mute * 1000).toISOString() : undefined,
         last_message_at: chat.conversationTimestamp 
-          ? new Date(chat.conversationTimestamp * 1000).toISOString() 
+          ? new Date(Number(chat.conversationTimestamp) * 1000).toISOString() 
           : undefined,
         metadata: {
           archived: chat.archived,
-          pinned: chat.pinned,
-          mute: chat.mute
+          pinned: chat.pinned
         }
       });
     }
@@ -327,17 +318,13 @@ export class WhatsAppClient {
           name: update.name || existing.name,
           unread_count: update.unreadCount ?? existing.unread_count,
           is_pinned: update.pinned !== undefined ? !!update.pinned : existing.is_pinned,
-          mute_until: update.mute 
-            ? new Date(update.mute * 1000).toISOString() 
-            : existing.mute_until,
           last_message_at: update.conversationTimestamp 
-            ? new Date(update.conversationTimestamp * 1000).toISOString() 
+            ? new Date(Number(update.conversationTimestamp) * 1000).toISOString() 
             : existing.last_message_at,
           metadata: {
             ...existing.metadata,
             archived: update.archived,
-            pinned: update.pinned,
-            mute: update.mute
+            pinned: update.pinned
           }
         });
       }
@@ -410,6 +397,8 @@ export class WhatsAppClient {
       case 'document':
         result = await this.socket.sendMessage(jid, {
           document: { url: filePath },
+          mimetype: 'application/pdf',
+          fileName: filePath.split('/').pop() || 'document.pdf',
           caption
         });
         break;
