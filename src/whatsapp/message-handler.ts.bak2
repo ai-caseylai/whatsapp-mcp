@@ -134,8 +134,6 @@ export class MessageHandler {
 
     return {
       message_id: msg.key.id!,
-      jid: msg.key.remoteJid!,                // 完整的 remote JID
-      lid: msg.key.lid as string | undefined || undefined,           // WhatsApp LID
       sender_jid: msg.key.participant || msg.key.remoteJid!,
       sender_name: msg.pushName ?? undefined,
       message_type: messageType,
@@ -147,35 +145,10 @@ export class MessageHandler {
       is_from_me: msg.key.fromMe || false,
       timestamp: new Date(msg.messageTimestamp! as number * 1000).toISOString(),
       metadata: {
-        // 消息基本信息
-        key: msg.key,
-        messageTimestamp: msg.messageTimestamp,
         messageStubType: msg.messageStubType,
         messageStubParameters: msg.messageStubParameters,
         participant: msg.participant,
-        
-        // 消息状态信息
-        status: msg.status,
-        messageCiphertext: (msg as any).messageCiphertext,
-        
-        // 媒体信息
-        mediaKey: (msg as any).mediaKey,
-        
-        // 其他元数据
-        ephemeralOutOfSync: msg.ephemeralOutOfSync,
-        verifiedBizName: msg.verifiedBizName,
-        broadcast: msg.broadcast,
-        
-        // 原始消息对象（完整消息结构）
-        rawMessage: msg.message,
-        
-        // 调试信息
-        _debug: {
-          hasMessage: !!msg.message,
-          messageTypes: msg.message ? Object.keys(msg.message) : [],
-          deviceSentMessage: (msg as any).deviceSentMessage,
-          messageContextInfo: (msg as any).messageContextInfo
-        }
+        ephemeralOutOfSync: msg.ephemeralOutOfSync
       }
     };
   }

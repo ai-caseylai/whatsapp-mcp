@@ -70,7 +70,7 @@ function getHomeHTML() {
       '<div style="color:' + statusColor + ';font-size:13px;margin-top:4px;">' + statusText + '</div>' +
       '</div>' +
       '<div>' +
-      '<a href="/device/' + id + '" style="padding:8px 16px;background:#667eea;color:white;text-decoration:none;border-radius:6px;font-size:14px;">查看</a>' +
+      '<button onclick="logoutDevice(\'' + id + '\')" style="padding:8px 16px;background:#f56565;color:white;border:none;border-radius:6px;font-size:14px;cursor:pointer;">登出</button>' +
       '</div>' +
       '</div>';
   }
@@ -91,7 +91,7 @@ function getHomeHTML() {
     '<button class="btn-add" onclick="addDevice()" ' + (sessions.size >= MAX_SESSIONS ? 'disabled' : '') + '>➕ 添加新设备</button>' +
     devicesHtml +
     '<p class="stats">' + sessions.size + ' / ' + MAX_SESSIONS + '</p></div>' +
-    '<script>function addDevice(){fetch("/api/sessions",{method:"POST"}).then(r=>r.json()).then(d=>{if(d.success)location.href="/device/"+d.sessionId;});}</script></body></html>';
+    '<script>function addDevice(){fetch("/api/sessions",{method:"POST"}).then(r=>r.json()).then(d=>{if(d.success)location.href="/device/"+d.sessionId;});}function logoutDevice(id){if(confirm("確定要登出此設備嗎？")){fetch("/api/sessions/"+id,{method:"DELETE"}).then(r=>r.json()).then(d=>{if(d.success)location.reload();else alert("登出失敗: "+d.error);});}}</script></body></html>';
 }
 
 // 设备连接页
@@ -295,6 +295,11 @@ app.get('/device', (req, res) => res.send('<!DOCTYPE html><html><head><meta char
   '</style></head><body><div class="box"><div style="font-size:48px">⚠️</div><h3>缺少设备 ID</h3><p style="color:#666">URL 格式: /device/&lt;session-id&gt;</p><a href="/admin" style="padding:12px 24px;background:#667eea;color:white;text-decoration:none;border-radius:8px;display:inline-block">返回管理页</a></div></body></html>'));
 
 // 管理首页 - /admin
+
+// MCP Client 頁面
+app.get('/mcp-client', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'mcp-client.html'));
+});
 app.get('/admin', (req, res) => res.send(getHomeHTML()));
 
 // 根路径重定向到 /admin

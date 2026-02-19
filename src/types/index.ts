@@ -61,6 +61,8 @@ export interface WaMessage {
   is_edited: boolean;
   edited_at?: string;
   timestamp: string;
+  jid?: string;              // 消息的完整 JID (例如: 1234567890@s.whatsapp.net)
+  lid?: string;              // WhatsApp LID
   metadata: Record<string, unknown>;
   created_at: string;
 }
